@@ -1,9 +1,9 @@
 from flask import Flask, request, jsonify
 import pandas as pd
 import numpy as np
-import pickle
-import os
+import joblib
 import logging
+import os
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -13,90 +13,131 @@ app = Flask(__name__)
 
 # Global variables
 books_df = None
+ratings_df = None
 svd_model = None
 item_factors = None
 isbn_to_idx = None
 idx_to_isbn = None
+city_popularity = None
 user_demo_data = None
+metadata = None
 
-def load_model_components(model_dir="model_data"):
-    """Load trained model components from disk"""
-    global books_df, svd_model, item_factors, isbn_to_idx, idx_to_isbn, user_demo_data
+def initialize():
+    """Initialize the recommendation system by loading pre-trained models"""
+    global books_df, ratings_df, svd_model, item_factors, isbn_to_idx, idx_to_isbn
+    global city_popularity, user_demo_data, metadata
     
     try:
-        # Load SVD model and item factors
-        with open(os.path.join(model_dir, "svd_model.pkl"), "rb") as f:
-            svd_model = pickle.load(f)
+        # Check if models directory exists
+        if not os.path.exists('models'):
+            logger.error("Models directory not found. Please run train_models.py first.")
+            return False
         
-        with open(os.path.join(model_dir, "item_factors.pkl"), "rb") as f:
-            item_factors = pickle.load(f)
+        # Load models and mappings
+        books_df = pd.read_pickle('models/books_df_slim.pkl')
+        ratings_df = pd.read_pickle('models/ratings_slim.pkl')
+        svd_model = joblib.load('models/svd_model.pkl')
+        item_factors = joblib.load('models/item_factors.pkl')
+        isbn_to_idx = joblib.load('models/isbn_to_idx.pkl')
+        idx_to_isbn = joblib.load('models/idx_to_isbn.pkl')
+        city_popularity = joblib.load('models/city_popularity.pkl')
+        user_demo_data = joblib.load('models/user_demo_data.pkl')
+        metadata = joblib.load('models/metadata.pkl')
         
-        # Load mappings
-        with open(os.path.join(model_dir, "isbn_mappings.pkl"), "rb") as f:
-            mappings = pickle.load(f)
-            isbn_to_idx = mappings["isbn_to_idx"]
-            idx_to_isbn = mappings["idx_to_isbn"]
-        
-        # Load books dataframe
-        books_df = pd.read_pickle(os.path.join(model_dir, "books_minimal.pkl"))
-        
-        # Load user demographic data
-        with open(os.path.join(model_dir, "user_demo_data.pkl"), "rb") as f:
-            user_demo_data = pickle.load(f)
-        
-        logger.info(f"Model components loaded from {model_dir}")
+        logger.info("Recommendation system initialized successfully from saved models")
+        logger.info(f"Loaded model with {metadata['n_components']} components")
+        logger.info(f"Books: {metadata['n_books']}, Users: {metadata['n_users']}, Ratings: {metadata['n_ratings']}")
         return True
-        
     except Exception as e:
-        logger.error(f"Error loading model components: {str(e)}")
+        logger.error(f"Failed to load models: {str(e)}")
         return False
 
-def demographic_similarity(user_age, user_demo_data, rated_books):
-    """Calculate demographic similarity scores for books based on user age"""
+def demographic_similarity(user_age, user_city, user_demo_data, ratings_df):
+    """Calculate demographic similarity scores for books based on user age and city"""
     try:
+        global city_popularity
         demo_scores = {}
         
-        # Access user age data from pre-loaded demo data
-        for isbn in idx_to_isbn.values():
-            # Skip books the user has already rated
-            if isbn in rated_books:
-                continue
-                
-            # Find users who rated this book
-            relevant_users = []
-            for user_id, demo_data in user_demo_data.items():
-                if 'Age' in demo_data:
-                    relevant_users.append((user_id, demo_data['Age']))
+        # Normalize user city to lowercase for comparison
+        if user_city:
+            user_city = user_city.lower()
+        
+        # Prepare ratings with demographic data
+        isbn_groups = {}
+        for _, row in ratings_df.iterrows():
+            isbn = row['ISBN']
+            user_id = row['userID']
+            rating = row['bookRating']
             
-            if not relevant_users:
-                demo_scores[isbn] = 0.5  # Neutral score
-                continue
+            # Get user demographic data
+            demo_data = user_demo_data.get(user_id, {})
+            age = demo_data.get('Age')
+            city = demo_data.get('City')
+            
+            if isbn not in isbn_groups:
+                isbn_groups[isbn] = []
                 
-            # Calculate age-based similarity
-            age_scores = []
-            for _, age in relevant_users:
-                if age is not None:
+            isbn_groups[isbn].append((rating, age, city))
+        
+        # Calculate scores based on age and city
+        for isbn, ratings_list in isbn_groups.items():
+            demo_scores_list = []
+            
+            for rating, age, city in ratings_list:
+                # Initialize combined similarity score
+                combined_sim = 0.0
+                sim_factors = 0
+                
+                # Calculate age similarity if available
+                if age is not None and user_age is not None:
                     age_diff = abs(user_age - age)
                     # Age similarity decreases as age difference increases
                     # Max difference of 20 years leads to 0 similarity
                     age_sim = max(0, 1 - (age_diff / 20))
-                    age_scores.append(age_sim)
-            
-            # Use average age similarity as the demographic score
-            if age_scores:
-                demo_scores[isbn] = sum(age_scores) / len(age_scores)
-            else:
-                demo_scores[isbn] = 0.5  # Neutral score
+                    combined_sim += age_sim
+                    sim_factors += 1
                 
+                # Calculate city similarity if available
+                if city is not None and user_city is not None:
+                    # Exact city match gets highest similarity
+                    if city == user_city:
+                        city_sim = 1.0
+                    else:
+                        # Base similarity for different cities (using city popularity as a factor)
+                        # More popular cities get a slightly higher similarity score
+                        popularity_factor = city_popularity.get(city, 0.01)
+                        city_sim = 0.1 + (0.2 * popularity_factor)  # Between 0.1 and 0.3
+                    
+                    combined_sim += city_sim
+                    sim_factors += 1
+                
+                # Calculate average similarity if we have any factors
+                if sim_factors > 0:
+                    final_sim = combined_sim / sim_factors
+                    demo_scores_list.append((final_sim, rating))
+            
+            # Calculate weighted scores
+            if demo_scores_list:
+                sim_sum = sum(sim for sim, _ in demo_scores_list)
+                if sim_sum > 0:  # Prevent division by zero
+                    weighted_rating = sum(sim * rating for sim, rating in demo_scores_list) / sim_sum
+                else:
+                    weighted_rating = 5.0  # Neutral rating
+            else:
+                weighted_rating = 5.0  # Neutral rating
+                
+            # Final demographic score normalized to 0-1 range
+            demo_scores[isbn] = weighted_rating / 10.0
+        
         return demo_scores
         
     except Exception as e:
         logger.error(f"Error calculating demographic similarity: {str(e)}")
         return {}
 
-def get_recommendations(user_ratings, user_age=None, n_recommendations=10):
-    """Generate book recommendations based on user ratings and age"""
-    global books_df, item_factors, isbn_to_idx, idx_to_isbn, svd_model, user_demo_data
+def get_recommendations(user_ratings, user_age=None, user_city=None, n_recommendations=10):
+    """Generate book recommendations based on user ratings, age, and city"""
+    global books_df, ratings_df, item_factors, isbn_to_idx, idx_to_isbn, svd_model, user_demo_data
     
     try:
         # Convert user ratings to float values between 0-1
@@ -140,10 +181,10 @@ def get_recommendations(user_ratings, user_age=None, n_recommendations=10):
         # Final scores - start with content scores
         final_scores = content_scores.copy()
         
-        # Apply demographic filtering if age data is provided
-        if user_age is not None:
+        # Apply demographic filtering if demographic data is provided
+        if user_age is not None or user_city is not None:
             # Calculate demographic similarity scores
-            demo_scores = demographic_similarity(user_age, user_demo_data, user_ratings_norm)
+            demo_scores = demographic_similarity(user_age, user_city, user_demo_data, ratings_df)
             
             # Blend content-based and demographic scores (70% content, 30% demographic)
             for isbn in content_scores:
@@ -161,12 +202,21 @@ def get_recommendations(user_ratings, user_age=None, n_recommendations=10):
                 'ISBN': isbn,
                 'title': book_info['bookTitle'],
                 'author': book_info['bookAuthor'],
-                'year': book_info['yearOfPublication'],
+                'year': int(book_info['yearOfPublication']) if pd.notna(book_info['yearOfPublication']) else None,
                 'publisher': book_info['publisher'],
                 'score': float(score)
             })
         
-        return {"recommendations": recommendations}
+        # Include demographic factors used in recommendation
+        demographic_info = {
+            "age_used": user_age is not None,
+            "city_used": user_city is not None
+        }
+        
+        return {
+            "recommendations": recommendations,
+            "demographic_factors": demographic_info
+        }
         
     except Exception as e:
         logger.error(f"Error generating recommendations: {str(e)}")
@@ -184,6 +234,7 @@ def recommend():
         # Get user ratings and demographic info
         user_ratings = data['ratings']
         user_age = data.get('age')
+        user_city = data.get('city')
         
         # Validate ratings
         if not isinstance(user_ratings, dict):
@@ -200,8 +251,8 @@ def recommend():
         # Get number of recommendations
         num_recommendations = data.get('num_recommendations', 10)
         
-        # Generate recommendations
-        result = get_recommendations(user_ratings, user_age, num_recommendations)
+        # Generate recommendations with demographic data
+        result = get_recommendations(user_ratings, user_age, user_city, num_recommendations)
         
         if "error" in result:
             return jsonify(result), 400
@@ -214,37 +265,46 @@ def recommend():
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint"""
-    if all([books_df is not None, svd_model is not None]):
+    """Health check endpoint with model information"""
+    global metadata
+    
+    if all([books_df is not None, ratings_df is not None, svd_model is not None]):
         return jsonify({
             "status": "healthy", 
             "stats": {
                 "books": len(books_df),
+                "ratings": len(ratings_df),
                 "model_components": svd_model.n_components,
-                "demographic_data": "available" if user_demo_data else "unavailable"
+                "demographic_data": "available" if user_demo_data else "unavailable",
+                "demographic_factors": ["Age", "City"] if user_demo_data else [],
+                "model_timestamp": metadata.get("timestamp", "unknown") if metadata else "unknown"
             }
         }), 200
     else:
-        return jsonify({"status": "unhealthy"}), 500
+        return jsonify({
+            "status": "unhealthy",
+            "error": "Model or data not properly loaded"
+        }), 500
 
-def initialize(model_dir="model_data"):
-    """Initialize the recommendation system on startup"""
-    global books_df, svd_model, item_factors, isbn_to_idx, idx_to_isbn, user_demo_data
+@app.route('/model_info', methods=['GET'])
+def model_info():
+    """Endpoint to get information about the loaded model"""
+    global metadata
     
-    # Load pre-trained model components
-    if not os.path.exists(model_dir):
-        logger.error(f"Model directory '{model_dir}' not found. Please run train_model.py first.")
-        return False
-        
-    if load_model_components(model_dir):
-        logger.info("Recommendation system initialized successfully")
-        return True
+    if metadata:
+        return jsonify({
+            "model_metadata": metadata,
+            "memory_usage": {
+                "books_df_size": f"{books_df.memory_usage(deep=True).sum() / (1024*1024):.2f} MB",
+                "ratings_df_size": f"{ratings_df.memory_usage(deep=True).sum() / (1024*1024):.2f} MB",
+                "item_factors_size": f"{item_factors.nbytes / (1024*1024):.2f} MB"
+            }
+        }), 200
     else:
-        logger.error("Failed to initialize the recommendation system")
-        return False
+        return jsonify({"error": "Model metadata not available"}), 404
 
 if __name__ == '__main__':
-    # Initialize data and model
+    # Initialize by loading pre-trained models
     if initialize():
         # Run the Flask app
         app.run(host='0.0.0.0', port=5001)
