@@ -24,32 +24,55 @@ metadata = None
 
 def initialize():
     """Initialize the recommendation system by loading pre-trained models"""
+    import pathlib
+
     global books_df, ratings_df, svd_model, item_factors, isbn_to_idx, idx_to_isbn
     global city_popularity, user_demo_data, metadata
-    
+
     try:
-        # Check if models directory exists
-        if not os.path.exists('models'):
-            logger.error("Models directory not found. Please run train_models.py first.")
+        base_dir = pathlib.Path(__file__).resolve().parent
+        models_dir = base_dir / 'models'
+        
+        logger.info(f"Looking for models in: {models_dir}")
+
+        if not models_dir.exists():
+            logger.error(f"Models directory not found at {models_dir}. Did you forget to include it in your repo?")
             return False
-        
-        # Load models and mappings
-        books_df = pd.read_pickle('models/books_df_slim.pkl')
-        ratings_df = pd.read_pickle('models/ratings_slim.pkl')
-        svd_model = joblib.load('models/svd_model.pkl')
-        item_factors = joblib.load('models/item_factors.pkl')
-        isbn_to_idx = joblib.load('models/isbn_to_idx.pkl')
-        idx_to_isbn = joblib.load('models/idx_to_isbn.pkl')
-        city_popularity = joblib.load('models/city_popularity.pkl')
-        user_demo_data = joblib.load('models/user_demo_data.pkl')
-        metadata = joblib.load('models/metadata.pkl')
-        
+
+        # Create a helper to check each file
+        def load_or_log(file_name, loader):
+            file_path = models_dir / file_name
+            if not file_path.exists():
+                logger.error(f"Missing model file: {file_path}")
+                return None
+            logger.info(f"Loading: {file_path}")
+            return loader(file_path)
+
+        books_df = load_or_log('books_df_slim.pkl', pd.read_pickle)
+        ratings_df = load_or_log('ratings_slim.pkl', pd.read_pickle)
+        svd_model = load_or_log('svd_model.pkl', joblib.load)
+        item_factors = load_or_log('item_factors.pkl', joblib.load)
+        isbn_to_idx = load_or_log('isbn_to_idx.pkl', joblib.load)
+        idx_to_isbn = load_or_log('idx_to_isbn.pkl', joblib.load)
+        city_popularity = load_or_log('city_popularity.pkl', joblib.load)
+        user_demo_data = load_or_log('user_demo_data.pkl', joblib.load)
+        metadata = load_or_log('metadata.pkl', joblib.load)
+
+        required_objects = [
+            books_df, ratings_df, svd_model, item_factors,
+            isbn_to_idx, idx_to_isbn, city_popularity, user_demo_data, metadata
+        ]
+
+        if any(obj is None for obj in required_objects):
+            logger.error("One or more model files failed to load.")
+            return False
+
+
         logger.info("Recommendation system initialized successfully from saved models")
-        logger.info(f"Loaded model with {metadata['n_components']} components")
-        logger.info(f"Books: {metadata['n_books']}, Users: {metadata['n_users']}, Ratings: {metadata['n_ratings']}")
+        logger.info(f"Model metadata: {metadata}")
         return True
     except Exception as e:
-        logger.error(f"Failed to load models: {str(e)}")
+        logger.error(f"Exception during initialization: {str(e)}")
         return False
 
 def demographic_similarity(user_age, user_city, user_demo_data, ratings_df):
@@ -304,9 +327,7 @@ def model_info():
         return jsonify({"error": "Model metadata not available"}), 404
 
 if __name__ == '__main__':
-    # Initialize by loading pre-trained models
     if initialize():
-        # Run the Flask app
-        app.run(host='0.0.0.0', port=5001)
+        app.run()
     else:
         logger.error("Failed to initialize the recommendation system")
