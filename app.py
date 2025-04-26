@@ -4,67 +4,36 @@ import numpy as np
 import joblib
 import logging
 import os
+from flask_cors import CORS
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all domains on all routes
 
-# Global variables for models and data
-models = {
-    'books_df': None,
-    'ratings_df': None,
-    'svd_model': None,
-    'item_factors': None,
-    'isbn_to_idx': None,
-    'idx_to_isbn': None,
-    'city_popularity': None,
-    'user_demo_data': None,
-    'metadata': None
-}
-
-def load_models():
-    """Load all model files from current directory"""
-    model_files = {
-        'books_df': ('books_df_slim.pkl', pd.read_pickle),
-        'ratings_df': ('ratings_slim.pkl', pd.read_pickle),
-        'svd_model': ('svd_model.pkl', joblib.load),
-        'item_factors': ('item_factors.pkl', joblib.load),
-        'isbn_to_idx': ('isbn_to_idx.pkl', joblib.load),
-        'idx_to_isbn': ('idx_to_isbn.pkl', joblib.load),
-        'city_popularity': ('city_popularity.pkl', joblib.load),
-        'user_demo_data': ('user_demo_data.pkl', joblib.load),
-        'metadata': ('metadata.pkl', joblib.load)
-    }
+# Load models - simplified approach
+try:
+    logger.info("Loading recommendation system models...")
+    books_df = pd.read_pickle("models/books_df_slim.pkl")
+    ratings_df = pd.read_pickle("models/ratings_slim.pkl")
+    svd_model = joblib.load("models/svd_model.pkl")
+    item_factors = joblib.load("models/item_factors.pkl")
+    isbn_to_idx = joblib.load("models/isbn_to_idx.pkl")
+    idx_to_isbn = joblib.load("models/idx_to_isbn.pkl")
+    city_popularity = joblib.load("models/city_popularity.pkl")
+    user_demo_data = joblib.load("models/user_demo_data.pkl")
+    metadata = joblib.load("models/metadata.pkl")
     
-    missing_files = []
-    
-    for model_name, (filename, loader) in model_files.items():
-        try:
-            if not os.path.exists(filename):
-                missing_files.append(filename)
-                continue
-                
-            logger.info(f"Loading {filename}...")
-            models[model_name] = loader(filename)
-        except Exception as e:
-            logger.error(f"Failed to load {filename}: {str(e)}")
-            missing_files.append(filename)
-    
-    if missing_files:
-        logger.error(f"Missing or failed to load: {', '.join(missing_files)}")
-        return False
-        
-    # Verify critical components
-    critical_components = ['books_df', 'ratings_df', 'svd_model', 'item_factors']
-    for component in critical_components:
-        if models[component] is None:
-            logger.error(f"Critical component {component} is None")
-            return False
-    
-    logger.info(f"Successfully loaded {len(models['books_df'])} books and {len(models['ratings_df'])} ratings")
-    return True
+    logger.info(f"Successfully loaded {len(books_df)} books and {len(ratings_df)} ratings")
+    models_loaded = True
+except FileNotFoundError as e:
+    logger.error(f"Error: Model files not found. {str(e)}")
+    models_loaded = False
+except Exception as e:
+    logger.error(f"Error loading models: {str(e)}")
+    models_loaded = False
 
 def demographic_similarity(user_age, user_city):
     """Calculate demographic similarity scores for books based on user age and city"""
@@ -77,13 +46,13 @@ def demographic_similarity(user_age, user_city):
         
         # Prepare ratings with demographic data
         isbn_groups = {}
-        for _, row in models['ratings_df'].iterrows():
+        for _, row in ratings_df.iterrows():
             isbn = row['ISBN']
             user_id = row['userID']
             rating = row['bookRating']
             
             # Get user demographic data
-            demo_data = models['user_demo_data'].get(user_id, {})
+            demo_data = user_demo_data.get(user_id, {})
             age = demo_data.get('Age')
             city = demo_data.get('City')
             
@@ -118,7 +87,7 @@ def demographic_similarity(user_age, user_city):
                     else:
                         # Base similarity for different cities (using city popularity as a factor)
                         # More popular cities get a slightly higher similarity score
-                        popularity_factor = models['city_popularity'].get(city, 0.01)
+                        popularity_factor = city_popularity.get(city, 0.01)
                         city_sim = 0.1 + (0.2 * popularity_factor)  # Between 0.1 and 0.3
                     
                     combined_sim += city_sim
@@ -155,17 +124,17 @@ def get_recommendations(user_ratings, user_age=None, user_city=None, n_recommend
         user_ratings_norm = {isbn: float(rating)/10.0 for isbn, rating in user_ratings.items()}
         
         # Find which books in the user's ratings exist in our model
-        valid_isbns = [isbn for isbn in user_ratings_norm.keys() if isbn in models['isbn_to_idx']]
+        valid_isbns = [isbn for isbn in user_ratings_norm.keys() if isbn in isbn_to_idx]
         
         if not valid_isbns:
             return {"error": "None of the rated books exist in our database"}
         
         # Project user ratings into latent space
-        user_vector = np.zeros(models['svd_model'].n_components)
+        user_vector = np.zeros(svd_model.n_components)
         for isbn in valid_isbns:
-            item_idx = models['isbn_to_idx'][isbn]
+            item_idx = isbn_to_idx[isbn]
             rating = user_ratings_norm[isbn]
-            user_vector += rating * models['item_factors'][item_idx]
+            user_vector += rating * item_factors[item_idx]
         
         # Normalize user vector
         norm = np.linalg.norm(user_vector)
@@ -174,12 +143,12 @@ def get_recommendations(user_ratings, user_age=None, user_city=None, n_recommend
         
         # Calculate similarity scores for all books
         content_scores = {}
-        for idx, isbn in models['idx_to_isbn'].items():
+        for idx, isbn in idx_to_isbn.items():
             # Skip books the user has already rated
             if isbn in user_ratings_norm:
                 continue
                 
-            item_vec = models['item_factors'][idx]
+            item_vec = item_factors[idx]
             item_norm = np.linalg.norm(item_vec)
             
             if item_norm > 0:
@@ -208,7 +177,7 @@ def get_recommendations(user_ratings, user_age=None, user_city=None, n_recommend
         # Format recommendations with book details
         recommendations = []
         for isbn, score in top_isbns:
-            book_info = models['books_df'][models['books_df']['ISBN'] == isbn]
+            book_info = books_df[books_df['ISBN'] == isbn]
             if not book_info.empty:
                 book_info = book_info.iloc[0]
                 recommendations.append({
@@ -238,7 +207,7 @@ def get_recommendations(user_ratings, user_age=None, user_city=None, n_recommend
 @app.route('/recommendations', methods=['POST'])
 def recommend():
     """API endpoint to get book recommendations"""
-    if not all(models[key] is not None for key in ['books_df', 'ratings_df', 'svd_model']):
+    if not models_loaded:
         return jsonify({
             "error": "Recommendation system not properly initialized",
             "status": "Service unavailable"
@@ -285,62 +254,49 @@ def recommend():
 @app.route('/', methods=['GET'])
 def health():
     """Health check endpoint with model information"""
-    if all(models[key] is not None for key in ['books_df', 'ratings_df', 'svd_model']):
+    if models_loaded:
         return jsonify({
             "status": "healthy", 
             "stats": {
-                "books": len(models['books_df']),
-                "ratings": len(models['ratings_df']),
-                "model_components": models['svd_model'].n_components,
-                "demographic_data": "available" if models['user_demo_data'] else "unavailable",
-                "demographic_factors": ["Age", "City"] if models['user_demo_data'] else [],
-                "model_timestamp": models['metadata'].get("timestamp", "unknown") if models['metadata'] else "unknown"
+                "books": len(books_df),
+                "ratings": len(ratings_df),
+                "model_components": svd_model.n_components,
+                "demographic_data": "available" if user_demo_data else "unavailable",
+                "demographic_factors": ["Age", "City"] if user_demo_data else [],
+                "model_timestamp": metadata.get("timestamp", "unknown") if metadata else "unknown"
             }
         }), 200
     else:
-        # Return which components are missing
-        missing_components = [k for k, v in models.items() if v is None]
         return jsonify({
             "status": "unhealthy",
-            "error": "Model or data not properly loaded",
-            "missing_components": missing_components
+            "error": "Model or data not properly loaded"
         }), 500
 
 @app.route('/model_info', methods=['GET'])
 def model_info():
     """Endpoint to get information about the loaded model"""
-    if models['metadata']:
+    if models_loaded and metadata:
         try:
             return jsonify({
-                "model_metadata": models['metadata'],
+                "model_metadata": metadata,
                 "memory_usage": {
-                    "books_df_size": f"{models['books_df'].memory_usage(deep=True).sum() / (1024*1024):.2f} MB" 
-                        if models['books_df'] is not None else "Not loaded",
-                    "ratings_df_size": f"{models['ratings_df'].memory_usage(deep=True).sum() / (1024*1024):.2f} MB" 
-                        if models['ratings_df'] is not None else "Not loaded",
-                    "item_factors_size": f"{models['item_factors'].nbytes / (1024*1024):.2f} MB" 
-                        if models['item_factors'] is not None else "Not loaded"
+                    "books_df_size": f"{books_df.memory_usage(deep=True).sum() / (1024*1024):.2f} MB",
+                    "ratings_df_size": f"{ratings_df.memory_usage(deep=True).sum() / (1024*1024):.2f} MB",
+                    "item_factors_size": f"{item_factors.nbytes / (1024*1024):.2f} MB"
                 },
-                "model_files_location": os.path.abspath('.'),
-                "available_model_files": [f for f in os.listdir('.') if f.endswith('.pkl') or f.endswith('.joblib')]
+                "model_files_location": os.path.abspath('models'),
+                "available_model_files": [f for f in os.listdir('models') if f.endswith('.pkl') or f.endswith('.joblib')]
             }), 200
         except Exception as e:
             return jsonify({
                 "error": f"Error retrieving model info: {str(e)}",
-                "model_metadata": models['metadata']
+                "model_metadata": metadata
             }), 500
     else:
         return jsonify({"error": "Model metadata not available"}), 404
 
 if __name__ == '__main__':
-    # Initialize the recommendation system
-    logger.info("Initializing recommendation system...")
-    initialization_successful = load_models()
-    
-    if initialization_successful:
-        port = int(os.environ.get('PORT', 5001))
-        logger.info(f"Starting recommendation service on port {port}")
-        app.run(host='0.0.0.0', port=port)
-    else:
-        logger.error("Failed to initialize the recommendation system. Exiting.")
-        exit(1)
+    # Start the server
+    port = int(os.environ.get('PORT', 5001))
+    logger.info(f"Starting recommendation service on port {port}")
+    app.run(host='0.0.0.0', port=port, debug=False)
